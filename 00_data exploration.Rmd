@@ -1,0 +1,281 @@
+---
+title: "00_data exploration"
+author: "Brenna Kelly"
+date: "2025-06-26"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+
+```{r}
+
+library(dplyr)
+library(ggplot2)
+library(stringr)
+library(lubridate)
+
+```
+
+
+
+```{r}
+
+ihc <- read.csv('/Users/brenna/Documents/School/Research/aq-infx/data/SaltLake&UtahCoICAXR07012018t03312025.csv')
+
+# doesn't have space
+
+names(ihc) <- c("date", "rx_rate", "rx_num", "rx_denom")
+
+ihc$date <- dmy(ihc$date)
+
+ihc$rx_rate <- as.numeric(str_replace(ihc$rx_rate, "%", ""))
+
+ggplot(ihc, aes(x = date, y = rx_rate)) +
+  geom_point() +
+  theme_bw()
+
+summary(ihc) # overlap with inversion data (through Feb 2022)
+
+# add inversion data to this
+inv <- read.csv("/Users/brenna/Downloads/inversion_data.csv")
+
+names(inv) <- tolower(names(inv))
+
+inv$date <- mdy(inv$date)
+
+# balloon is for SLC only; use ERA
+
+inv$inversion <- ifelse(inv$era.adj.cap == "TRUE", "inversion", "no inversion") # MAYBE = NO
+
+# there are multiple stations which can be yes/no cold pool; Ogden, Provo, SLC
+prop.table(table(inv$date, inv$era.adj.cap), margin = 1)
+# it's possible that inversion = YES for SLC is inversion = MAYBE for SLC
+# for now, since the data is aggregated, inversion anywhere = inversion everywhere
+
+inv <- inv |>
+  filter(inversion == "inversion") |>
+  # distinct(date, .keep_all = TRUE) |>
+  select(c(date, inversion))
+
+# merge
+ihc_inv <- merge(ihc, inv, by = "date", all.x = TRUE) |>
+  filter(date <= "2022-02-15")
+# the inversion data only goes through this date
+
+ihc_inv <- ihc_inv |>
+  mutate(inversion = case_when(is.na(inversion) ~ 0,
+                               inversion == "no inversion" ~ 0,
+                               inversion == "inversion" ~ 1)) |>
+  mutate(inversion = as.factor(inversion))
+
+ggplot(ihc_inv, aes(x = date, y = rx_rate, group = 1, colour = inversion)) +
+  geom_line() +
+  geom_path() +
+  scale_colour_brewer(palette = "Dark2") +
+  ylab("Rx Rate") + xlab("Date") +
+  theme_bw()
+
+
+```
+
+
+summary stats for prescription rates
+
+```{r}
+
+# day of the week
+ihc_inv$weekday <- wday(ihc_inv$date, label = TRUE)
+# weekend
+ihc_inv$weekend <- ifelse(ihc_inv$weekday %in% c("Sun", "Sat"), "weekend", "weekday")
+
+plot(
+  aggregate(ihc_inv$rx_rate, by = list(ihc_inv$weekday), FUN = mean)
+     )
+
+
+
+
+```
+
+
+adding AQI
+
+```{r}
+
+aqi_files <- paste0("data/", list.files("data", pattern = "aqi"))
+
+aqi_list <- list()
+
+for(i in 1:length(aqi_files)) {
+  
+  test <- read.csv(aqi_files[i])
+  aqi_list[[i]] <- test
+  
+}
+
+aqi <- do.call("rbind", aqi_list)
+names(aqi) <- tolower(names(aqi))
+
+# only PM2.5? this removes too many dates
+aqi <- aqi |>
+  filter(state.name == "Utah" & county.name == "Salt Lake") |>
+  # filter(defining.parameter == "PM2.5") |>
+  select(c(date, aqi, defining.parameter, category))
+
+aqi$date <- ymd(aqi$date)
+
+ihc_aqi <- merge(ihc, aqi, by = "date") # some missing
+
+# missing <- ihc_aqi |>
+#   filter(is.na(aqi))
+# 
+# summary(missing)
+
+ggplot(ihc_aqi, aes(x = date, y = rx_rate)) + #, group = 1, colour = inversion)) +
+  geom_point() +
+  # geom_path() +
+  scale_colour_brewer(palette = "Dark2") +
+  ylab("Rx Rate") + xlab("Date") +
+  theme_bw()
+
+
+cor.test(ihc_aqi$aqi, ihc_aqi$rx_rate)
+
+```
+
+just... DLNM it
+
+```{r}
+
+# AQI distributed lag
+
+library(dlnm)
+
+## build the cross-basis of inversions
+cb1.inv <- crossbasis(ihc_aqi$aqi, lag = 10,
+                      argvar = list(fun="bs"),#, knots = 3),
+                      arglag = list(fun="bs"))#, knots = 3))
+                      # argvar = list(fun="ns", knots = 3), 
+                      # arglag = list(fun="ns", knots = 3))
+# note: b splines fit better; AIC decreases from 33589 to 33152
+summary(cb1.inv)
+
+## pm
+dl_inv <- glm(rx_num ~ cb1.inv + offset(log(rx_denom)),
+              data = ihc_aqi, family = "poisson")
+
+summary(dl_inv)
+
+pred1 <- crosspred(cb1.inv, dl_inv, at = 0:230, cumul = TRUE)#, at = 0:200,#0.27:199, 
+                   # bylag = 1, cumul = TRUE, cen = mean(early_preg_exp$max_pm))
+
+plot(pred1, zlab = "Risk of Rx", xlab = "AQI", ylab = "Lag from 7 days")
+
+par(mfrow = c(2, 3))
+plot(pred1, var = 2, ylim = c(0.85, 1.3), ylab = "Risk of Rx", 
+     xlab = "Days since exposure", main = "AQI = 2")
+plot(pred1, var = 50, ylim = c(0.85, 1.3), ylab = "Risk of Rx", 
+     xlab = "Days since exposure", main = "AQI = 50")
+plot(pred1, var = 100, ylim = c(0.85, 1.3), ylab = "Risk of Rx", 
+     xlab = "Days since exposure", main = "AQI = 100")
+plot(pred1, var = 150, ylim = c(0.85, 1.3), ylab = "Risk of Rx", 
+     xlab = "Days since exposure", main = "AQI = 150")
+plot(pred1, var = 200, ylim = c(0.85, 1.3), ylab = "Risk of Rx", 
+     xlab = "Days since exposure", main = "AQI = 200")
+plot(pred1, var = 230, ylim = c(0.85, 1.3), ylab = "Risk of Rx", 
+     xlab = "Days since exposure", main = "AQI = 230")
+
+# pred2 <- crosspred(cb1.inv, dl_inv, cumul = TRUE)
+# 
+# plot(pred2, var = 10, ylim = c(0.85, 1.1))
+
+# plot(pred2, zlab = "Risk of Rx", xlab = "Inversion (0/1)", ylab = "Lag from 7 days")
+
+
+
+```
+
+
+
+
+```{r}
+
+library(dlnm)
+
+## build the cross-basis of inversions
+cb1.inv <- crossbasis(ihc_inv$inversion, lag = 7,
+                      argvar = list(fun="ns"),
+                      arglag = list(fun="ns", knots = 2))
+                      # argvar = list(fun="ns", knots = 3), 
+                      # arglag = list(fun="ns", knots = 3))
+summary(cb1.inv)
+
+## pm
+dl_inv <- glm(rx_num ~ cb1.inv + offset(log(rx_denom)) + weekend,
+              data = ihc_inv, family = "poisson")
+
+summary(dl_inv)
+
+pred1 <- crosspred(cb1.inv, dl_inv, at = 0:1, cumul = TRUE)#, at = 0:200,#0.27:199, 
+                   # bylag = 1, cumul = TRUE, cen = mean(early_preg_exp$max_pm))
+
+plot(pred1, xlab = "Inversion (0/1)", ylab = "Lag from 7 days")
+
+pred2 <- crosspred(cb1.inv, dl_inv, cumul = TRUE)
+
+plot(pred2, var = 1)
+
+plot(pred1.pm.max, zlab = "Risk of Rx", xlab = "Inversion (0/1)", ylab = "Lag from 7 days")
+
+
+```
+
+
+crossover
+- "case" being the days preceding an inversion
+
+```{r}
+
+head(ihc_inv)
+
+
+ihc_inv$weekend <- wday(ihc_inv$date, label = TRUE)
+ihc_inv$weekend <- ifelse(ihc_inv$weekend %in% c("Sun", "Sat"), "weekend", "weekday")
+
+ihc_inv$weekend <- relevel(as.factor(ihc_inv$weekend), ref = "weekday")
+
+ihc_inv <- ihc_inv |>
+  mutate(control = lead(ihc_inv$inversion, n = 4)) |>
+  mutate(control = case_when(control == 1 & inversion == 1 ~ 0,
+                             control == 1 & inversion == 0 ~ 1, # can't be a control if it's also a case
+                             control == 0 & inversion == 1 ~ 0,
+                             control == 0 & inversion == 0 ~ 0,
+                             is.na(control) ~ 0))
+
+# only cases and controls
+cc <- ihc_inv |>
+  filter(inversion == 1 | control == 1) |>
+  mutate(case = ifelse(control == 1, 0, 1))
+
+control_num <- aggregate(cc$rx_num, by = list(cc$case), FUN = sum)[1, 2]
+case_num <- aggregate(cc$rx_num, by = list(cc$case), FUN = sum)[2, 2]
+
+control_denom <- aggregate(cc$rx_denom, by = list(cc$case), FUN = sum)[1, 2]
+case_denom <- aggregate(cc$rx_denom, by = list(cc$case), FUN = sum)[2, 2]
+
+# exposed / at risk
+
+rate_in_cases <- case_num / case_denom # event in exposed
+rate_in_controls <- control_num / control_denom # event in unexposed
+
+rate_in_cases / rate_in_controls
+
+### let's try to model this to account for weekend/weekday etc.
+
+```
+
+
+
